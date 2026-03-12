@@ -20,14 +20,14 @@ project/
 
 Use the ODM/OpenSfM undistorted reference images as `project/images` (copy or symlink).
 
-`prepare_empty_rec` always requires a provided `--nvm` path.
+`prepare_empty_rec` uses fixed project-layout paths:
+- `project/opensfm/undistorted/reconstruction.nvm`
+- `project/images`
+
 The `reconstruction.nvm` file and the images in `project/images` must correspond.
 
 ```bash
-python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec \
-  --project /path/to/project \
-  --nvm /path/to/opensfm/undistorted/reconstruction.nvm \
-  --images-dir /path/to/project/images
+python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec --project /path/to/project
 ```
 
 Output of this step:
@@ -130,6 +130,6 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
 ## Assumptions
 
 - Single camera setup for the full dataset.
-- A valid OpenSfM/ODM NVM file is available and passed via `--nvm`.
+- A valid OpenSfM/ODM NVM file exists at `project/opensfm/undistorted/reconstruction.nvm`.
 - `project/images` contains the same images as the NVM with unique basenames.
 - `points3D` in `empty_rec` is intentionally empty.

@@ -23,6 +23,9 @@ from .fixed_center_solver import compute_center, refine_pose_fixed_center
 from .opensfm_to_empty_rec import create_empty_rec_from_nvm
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+DEFAULT_OPENSFM_NVM = Path("opensfm/undistorted/reconstruction.nvm")
+DEFAULT_REFERENCE_IMAGES = Path("images")
+DEFAULT_EMPTY_REC_DIR = Path("empty_rec")
 
 
 def list_images(root: Path) -> List[Path]:
@@ -333,9 +336,15 @@ def build_localizer_config(args: argparse.Namespace) -> Dict[str, Any]:
 
 def run_prepare_empty_rec(args: argparse.Namespace) -> None:
     project = args.project.resolve()
-    images_dir = resolve_optional_path(args.images_dir, project)
-    output_empty_rec = resolve_optional_path(args.output_empty_rec, project)
-    nvm_path = resolve_optional_path(args.nvm, project)
+    images_dir = project / DEFAULT_REFERENCE_IMAGES
+    output_empty_rec = project / DEFAULT_EMPTY_REC_DIR
+    nvm_path = project / DEFAULT_OPENSFM_NVM
+
+    if not nvm_path.exists():
+        raise FileNotFoundError(
+            "Missing OpenSfM/ODM reconstruction file at fixed location: "
+            f"{nvm_path}. Expected: project/opensfm/undistorted/reconstruction.nvm"
+        )
     create_empty_rec_from_nvm(project, images_dir, output_empty_rec, nvm_path)
 
 
@@ -764,16 +773,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     empty_rec = subparsers.add_parser(
         "prepare_empty_rec",
-        help="Convert ODM/OpenSfM NVM reconstruction to COLMAP empty_rec files.",
+        help=(
+            "Convert OpenSfM/ODM NVM to COLMAP empty_rec using fixed paths: "
+            "project/opensfm/undistorted/reconstruction.nvm -> project/empty_rec "
+            "with images from project/images."
+        ),
     )
     empty_rec.add_argument("--project", type=Path, required=True)
-    empty_rec.add_argument("--images-dir", type=Path, default=Path("images"))
-    empty_rec.add_argument("--output-empty-rec", type=Path, default=Path("empty_rec"))
-    empty_rec.add_argument(
-        "--nvm",
-        type=Path,
-        required=True,
-    )
     empty_rec.set_defaults(func=run_prepare_empty_rec)
 
     prepare = subparsers.add_parser(
