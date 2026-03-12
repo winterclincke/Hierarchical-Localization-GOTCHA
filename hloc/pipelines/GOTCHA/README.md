@@ -15,21 +15,59 @@ project/
   outputs/         # generated artifacts
 ```
 
-## 1) Prepare reference model
+## ODM quick start (3 commands)
 
-Build sparse points from known poses:
+Use the same undistorted images in step 1 that you will use later in `prepare_reference`.
+In practice: place the ODM undistorted images in `project/images` (copy or symlink).
+
+1. Convert ODM/OpenSfM NVM to `empty_rec`:
+
+```bash
+python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec --project /path/to/project
+```
+
+2. Triangulate sparse reference points from known poses:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference --project /path/to/project
 ```
 
-Main artifacts:
-- `project/outputs/features.h5`
-- `project/outputs/pairs-db-poses.txt`
-- `project/outputs/matches.h5`
-- `project/outputs/sfm_triangulated/`
+3. Localize query images:
 
-## 2) Localize queries
+```bash
+python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries --project /path/to/project
+```
+
+## NVM + images relation
+
+- The converter expects `reconstruction.nvm` and the undistorted reference images to match.
+- Default NVM path: `project/opensfm/undistorted/reconstruction.nvm`.
+- Default image path used for NVM matching: `project/images`.
+- If your undistorted images are located elsewhere, use:
+
+```bash
+python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec \
+  --project /path/to/project \
+  --nvm /path/to/opensfm/undistorted/reconstruction.nvm \
+  --images-dir /path/to/project/images
+```
+
+After this, `prepare_reference` must still run on the images in `project/images`.
+
+## Assumptions
+
+- Single camera setup for the full dataset.
+- ODM/OpenSfM provides `project/opensfm/undistorted/reconstruction.nvm`.
+- `project/images` contains the same images as the NVM (unique basename per file).
+- `points3D` in `empty_rec` is intentionally empty.
+
+## Camera model and geo note
+
+- `prepare_empty_rec` writes one shared camera as `SIMPLE_RADIAL` (single-camera assumption).
+- This does not create georeferencing by itself; it preserves the OpenSfM/ODM reference frame.
+- If your ODM reconstruction is georeferenced (depending on your ODM setup, e.g. GPS/RTK/calibration), `empty_rec` will follow that frame.
+
+## Localization options
 
 Standard retrieval-based localization:
 

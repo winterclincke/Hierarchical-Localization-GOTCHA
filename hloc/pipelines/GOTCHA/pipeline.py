@@ -20,6 +20,7 @@ from ... import (
 from ...localize_sfm import QueryLocalizer, pose_from_cluster
 from ...utils.parsers import parse_retrieval
 from .fixed_center_solver import compute_center, refine_pose_fixed_center
+from .opensfm_to_empty_rec import create_empty_rec_from_nvm
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
@@ -328,6 +329,14 @@ def build_localizer_config(args: argparse.Namespace) -> Dict[str, Any]:
             "print_summary": False,
         },
     }
+
+
+def run_prepare_empty_rec(args: argparse.Namespace) -> None:
+    project = args.project.resolve()
+    images_dir = resolve_optional_path(args.images_dir, project)
+    output_empty_rec = resolve_optional_path(args.output_empty_rec, project)
+    nvm_path = resolve_optional_path(args.nvm, project)
+    create_empty_rec_from_nvm(project, images_dir, output_empty_rec, nvm_path)
 
 
 def run_prepare_reference(args: argparse.Namespace) -> None:
@@ -742,6 +751,20 @@ def run_localize_queries(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GOTCHA pipeline for known-pose SfM and query localization.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    empty_rec = subparsers.add_parser(
+        "prepare_empty_rec",
+        help="Convert ODM/OpenSfM NVM reconstruction to COLMAP empty_rec files.",
+    )
+    empty_rec.add_argument("--project", type=Path, required=True)
+    empty_rec.add_argument("--images-dir", type=Path, default=Path("images"))
+    empty_rec.add_argument("--output-empty-rec", type=Path, default=Path("empty_rec"))
+    empty_rec.add_argument(
+        "--nvm",
+        type=Path,
+        default=Path("opensfm/undistorted/reconstruction.nvm"),
+    )
+    empty_rec.set_defaults(func=run_prepare_empty_rec)
 
     prepare = subparsers.add_parser(
         "prepare_reference",
