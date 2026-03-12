@@ -19,11 +19,15 @@ project/
 
 Use the same undistorted images in step 1 that you will use later in `prepare_reference`.
 In practice: place the ODM undistorted images in `project/images` (copy or symlink).
+`prepare_empty_rec` always consumes a provided NVM file plus the reference images.
 
-1. Convert ODM/OpenSfM NVM to `empty_rec`:
+1. Convert ODM/OpenSfM NVM + images to `empty_rec`:
 
 ```bash
-python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec --project /path/to/project
+python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec \
+  --project /path/to/project \
+  --nvm /path/to/opensfm/undistorted/reconstruction.nvm \
+  --images-dir /path/to/project/images
 ```
 
 2. Triangulate sparse reference points from known poses:
@@ -38,26 +42,10 @@ python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference --project /path/to/p
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries --project /path/to/project
 ```
 
-## NVM + images relation
-
-- The converter expects `reconstruction.nvm` and the undistorted reference images to match.
-- Default NVM path: `project/opensfm/undistorted/reconstruction.nvm`.
-- Default image path used for NVM matching: `project/images`.
-- If your undistorted images are located elsewhere, use:
-
-```bash
-python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec \
-  --project /path/to/project \
-  --nvm /path/to/opensfm/undistorted/reconstruction.nvm \
-  --images-dir /path/to/project/images
-```
-
-After this, `prepare_reference` must still run on the images in `project/images`.
-
 ## Assumptions
 
 - Single camera setup for the full dataset.
-- ODM/OpenSfM provides `project/opensfm/undistorted/reconstruction.nvm`.
+- ODM/OpenSfM provides a valid NVM reconstruction file.
 - `project/images` contains the same images as the NVM (unique basename per file).
 - `points3D` in `empty_rec` is intentionally empty.
 

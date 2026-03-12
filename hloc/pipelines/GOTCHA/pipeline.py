@@ -762,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     empty_rec.add_argument(
         "--nvm",
         type=Path,
-        default=Path("opensfm/undistorted/reconstruction.nvm"),
+        required=True,
     )
     empty_rec.set_defaults(func=run_prepare_empty_rec)
 
