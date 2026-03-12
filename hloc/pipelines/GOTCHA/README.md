@@ -86,23 +86,8 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --use-fixed-center
 ```
 
-- GT center map per image:
-
-```bash
-python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
-  --project /path/to/project \
-  --gt-center-image-map /path/to/gt_centers_per_image.json \
-  --use-fixed-center
-```
-
-- GT center map per cluster:
-
-```bash
-python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
-  --project /path/to/project \
-  --gt-center-cluster-map /path/to/gt_centers_per_cluster.json \
-  --use-fixed-center
-```
+- Per camera/PTZ workflow:
+  run `localize_queries` again with a different `--gt-center` value for each known camera position.
 
 - Manual query-reference pairs:
 

@@ -52,64 +52,8 @@ def resolve_optional_path(path: Path, project: Path) -> Path:
     return candidate if candidate.exists() else path
 
 
-def parse_center_value(value: Any) -> np.ndarray:
-    if isinstance(value, dict):
-        if {"x", "y", "z"} <= set(value.keys()):
-            return np.array([value["x"], value["y"], value["z"]], dtype=float)
-        raise ValueError("Center dict must contain x, y, and z.")
-    if isinstance(value, (list, tuple)) and len(value) == 3:
-        return np.array(value, dtype=float)
-    raise ValueError("Center value must be [x, y, z] or {x, y, z}.")
-
-
-def load_center_map(path: Path) -> Dict[str, np.ndarray]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError(f"Center map must be a JSON object: {path}")
-    return {str(key): parse_center_value(value) for key, value in raw.items()}
-
-
 def get_query_name(query_path: Path, project: Path) -> str:
     return query_path.relative_to(project).as_posix()
-
-
-def get_query_cluster(query_path: Path, queries_dir: Path) -> Optional[str]:
-    rel_query = query_path.relative_to(queries_dir)
-    return rel_query.parts[0] if len(rel_query.parts) > 1 else None
-
-
-def build_query_gt_centers(
-    query_paths: List[Path],
-    project: Path,
-    queries_dir: Path,
-    global_center: Optional[np.ndarray],
-    per_image_map: Dict[str, np.ndarray],
-    per_cluster_map: Dict[str, np.ndarray],
-) -> Dict[str, np.ndarray]:
-    centers: Dict[str, np.ndarray] = {}
-    default_center = per_image_map.get("default", per_image_map.get("*"))
-    if default_center is None:
-        default_center = per_cluster_map.get("default", per_cluster_map.get("*"))
-
-    for query_path in query_paths:
-        query_name = get_query_name(query_path, project)
-        if global_center is not None:
-            centers[query_name] = global_center
-            continue
-
-        if query_name in per_image_map:
-            centers[query_name] = per_image_map[query_name]
-            continue
-
-        cluster = get_query_cluster(query_path, queries_dir)
-        if cluster is not None and cluster in per_cluster_map:
-            centers[query_name] = per_cluster_map[cluster]
-            continue
-
-        if default_center is not None:
-            centers[query_name] = default_center
-
-    return centers
 
 
 def get_num_inliers(ret: Optional[Dict[str, Any]]) -> int:
@@ -521,41 +465,6 @@ def run_localize_queries(args: argparse.Namespace) -> None:
         raise ValueError("No reference image names from project/images were found in sfm model.")
 
     gt_center_global = np.array(args.gt_center, dtype=float) if args.gt_center else None
-    gt_center_image_map: Dict[str, np.ndarray] = {}
-    gt_center_cluster_map: Dict[str, np.ndarray] = {}
-    if args.gt_center_image_map is not None:
-        gt_image_path = resolve_optional_path(args.gt_center_image_map, project)
-        if not gt_image_path.exists():
-            raise FileNotFoundError(f"GT per-image center map not found: {gt_image_path}")
-        gt_center_image_map = load_center_map(gt_image_path)
-    if args.gt_center_cluster_map is not None:
-        gt_cluster_path = resolve_optional_path(args.gt_center_cluster_map, project)
-        if not gt_cluster_path.exists():
-            raise FileNotFoundError(
-                f"GT per-cluster center map not found: {gt_cluster_path}"
-            )
-        gt_center_cluster_map = load_center_map(gt_cluster_path)
-    if args.gt_center_map is not None:
-        legacy_path = resolve_optional_path(args.gt_center_map, project)
-        if not legacy_path.exists():
-            raise FileNotFoundError(f"GT center map not found: {legacy_path}")
-        legacy_map = load_center_map(legacy_path)
-        for key, center in legacy_map.items():
-            if key.startswith("queries/") or "/" in key:
-                gt_center_image_map[key] = center
-            elif key in {"default", "*"}:
-                gt_center_image_map[key] = center
-            else:
-                gt_center_cluster_map[key] = center
-
-    query_gt_centers = build_query_gt_centers(
-        query_paths=queries,
-        project=project,
-        queries_dir=queries_dir,
-        global_center=gt_center_global,
-        per_image_map=gt_center_image_map,
-        per_cluster_map=gt_center_cluster_map,
-    )
 
     localized_raw_poses: Dict[str, pycolmap.Rigid3d] = {}
     summary: List[Dict[str, Any]] = []
@@ -567,7 +476,7 @@ def run_localize_queries(args: argparse.Namespace) -> None:
     ) as img_fh:
         for query_path in queries:
             query_name = get_query_name(query_path, project)
-            query_gt_center = query_gt_centers.get(query_name)
+            query_gt_center = gt_center_global
 
             camera = pycolmap.infer_camera_from_image(query_path)
             if args.initial_focal_length is not None:
@@ -822,9 +731,6 @@ def build_parser() -> argparse.ArgumentParser:
     localize.add_argument("--fallback-trials", type=int, default=10)
     localize.add_argument("--fallback-min-inliers", type=int, default=15)
     localize.add_argument("--gt-center", nargs=3, type=float)
-    localize.add_argument("--gt-center-image-map", type=Path)
-    localize.add_argument("--gt-center-cluster-map", type=Path)
-    localize.add_argument("--gt-center-map", type=Path)
     localize.add_argument("--use-fixed-center", action="store_true")
     localize.add_argument("--keep-focal-fixed", action="store_true")
     localize.add_argument("--fixed-center-max-nfev", type=int, default=200)
