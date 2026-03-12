@@ -1,27 +1,27 @@
 # GOTCHA pipeline
 
-This pipeline is an upstream-safe extension for fixed-layout projects where:
-- reference images have known poses (`project/empty_rec`)
+- reference images have known poses (`project/empty_rec`) - for example from opendronemap/opensfm reconstruction
 - queries are localized against the triangulated reference model
-- optional GT camera centers can guide selection and fixed-center refinement
+- optional GT camera centers can guide selection and fixed-center refinement (when you know the 3d position e.g., from CCTV or PTZ cams)
 
 ## Project layout
 
 ```text
 project/
   images/          # reference images
-  queries/         # query images (can include subfolders, e.g. cluster names)
-  empty_rec/       # COLMAP text/binary model with known camera poses
-  outputs/         # generated artifacts
+  queries/         # query images (optionally grouped in subfolders)
+  empty_rec/       # COLMAP model with known reference poses
+  outputs/         # generated outputs
 ```
 
-## ODM quick start (3 commands)
+## Chronological workflow
 
-Use the same undistorted images in step 1 that you will use later in `prepare_reference`.
-In practice: place the ODM undistorted images in `project/images` (copy or symlink).
-`prepare_empty_rec` always consumes a provided NVM file plus the reference images.
+### Step 1: Import from ODM/OpenSfM
 
-1. Convert ODM/OpenSfM NVM + images to `empty_rec`:
+Use the ODM/OpenSfM undistorted reference images as `project/images` (copy or symlink).
+
+`prepare_empty_rec` always requires a provided `--nvm` path.
+The `reconstruction.nvm` file and the images in `project/images` must correspond.
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec \
@@ -30,40 +30,46 @@ python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec \
   --images-dir /path/to/project/images
 ```
 
-2. Triangulate sparse reference points from known poses:
+Output of this step:
+- `project/empty_rec/cameras.txt`, `images.txt`, `points3D.txt`
+- `project/empty_rec/cameras.bin`, `images.bin`, `points3D.bin`
+
+Camera/georeference note:
+- `prepare_empty_rec` writes one shared `SIMPLE_RADIAL` camera (single-camera assumption).
+- It does not create georeferencing by itself; it preserves the OpenSfM/ODM reference frame.
+- If your ODM reconstruction is georeferenced (depending on your ODM setup, e.g. GPS/RTK/calibration), `empty_rec` follows that frame.
+
+### Step 2: Triangulate reference points
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference --project /path/to/project
 ```
 
-3. Localize query images:
+Default behavior in this step:
+- Imported reference poses are kept fixed (pose adjustment disabled by default).
+- This default is intended to keep compatibility with reusing an existing ODM mesh reconstruction.
+
+Optional:
+- Enable pose adjustment/refinement with:
+
+```bash
+python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference \
+  --project /path/to/project \
+  --allow-pose-adjustment
+```
+
+- If you enable pose adjustment/refinement, re-run downstream dense/mesh reconstruction (MVS) with updated poses for consistency.
+
+### Step 3: Localize query images
+
+Base command:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries --project /path/to/project
 ```
 
-## Assumptions
-
-- Single camera setup for the full dataset.
-- ODM/OpenSfM provides a valid NVM reconstruction file.
-- `project/images` contains the same images as the NVM (unique basename per file).
-- `points3D` in `empty_rec` is intentionally empty.
-
-## Camera model and geo note
-
-- `prepare_empty_rec` writes one shared camera as `SIMPLE_RADIAL` (single-camera assumption).
-- This does not create georeferencing by itself; it preserves the OpenSfM/ODM reference frame.
-- If your ODM reconstruction is georeferenced (depending on your ODM setup, e.g. GPS/RTK/calibration), `empty_rec` will follow that frame.
-
-## Localization options
-
-Standard retrieval-based localization:
-
-```bash
-python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries --project /path/to/project
-```
-
-With fallback exhaustive search for hard queries:
+Common options:
+- Fallback exhaustive:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
@@ -71,7 +77,7 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --fallback-exhaustive
 ```
 
-With one shared GT center and fixed-center refinement:
+- Single GT center value:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
@@ -80,7 +86,7 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --use-fixed-center
 ```
 
-With per-image GT centers:
+- GT center map per image:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
@@ -89,7 +95,7 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --use-fixed-center
 ```
 
-With per-cluster GT centers:
+- GT center map per cluster:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
@@ -98,7 +104,7 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --use-fixed-center
 ```
 
-Manual query-reference pairs (one `query ref` pair per line):
+- Manual query-reference pairs:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
@@ -109,7 +115,7 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
 ## Outputs
 
 `localize_queries` writes:
-- `project/outputs/results.txt` (raw localized poses)
+- `project/outputs/results.txt`
 - `project/outputs/cameras_extra.txt`
 - `project/outputs/images_extra.txt`
 - `project/outputs/query_summary.json`
@@ -117,29 +123,13 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
 `query_summary.json` includes per query:
 - status
 - inliers
-- center distance (if GT center available)
+- center distance (if GT center is available)
 - fallback usage
 - reprojection stats for fixed-center refinement (if enabled)
 
-## GT center formats
+## Assumptions
 
-Per-image map (`--gt-center-image-map`):
-
-```json
-{
-  "default": [0.0, 0.0, 0.0],
-  "queries/T2/StaticCam_123.png": [-1.46, 0.92, -0.86]
-}
-```
-
-Per-cluster map (`--gt-center-cluster-map`):
-
-```json
-{
-  "T1": [5.37, -2.30, -0.90],
-  "T2": [-1.46, 0.92, -0.86]
-}
-```
-
-Cluster name is derived from the first subfolder under `project/queries`.
-Example: `project/queries/T2/StaticCam_123.png` belongs to cluster `T2`.
+- Single camera setup for the full dataset.
+- A valid OpenSfM/ODM NVM file is available and passed via `--nvm`.
+- `project/images` contains the same images as the NVM with unique basenames.
+- `points3D` in `empty_rec` is intentionally empty.

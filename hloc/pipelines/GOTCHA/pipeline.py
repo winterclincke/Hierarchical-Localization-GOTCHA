@@ -390,6 +390,15 @@ def run_prepare_reference(args: argparse.Namespace) -> None:
         overwrite=args.overwrite_matches,
     )
 
+    mapper_options: Dict[str, Any] = {}
+    if not args.allow_pose_adjustment:
+        mapper_options["fix_existing_images"] = True
+        logger.info(
+            "Pose adjustment is disabled (default): keeping imported reference poses fixed."
+        )
+    else:
+        logger.info("Pose adjustment is enabled: triangulation may refine reference poses.")
+
     triangulation.main(
         sfm_dir=sfm_dir,
         reference_model=empty_rec_dir,
@@ -400,6 +409,7 @@ def run_prepare_reference(args: argparse.Namespace) -> None:
         skip_geometric_verification=args.skip_geometric_verification,
         estimate_two_view_geometries=args.estimate_two_view_geometries,
         verbose=args.verbose,
+        mapper_options=mapper_options,
     )
     logger.info("Reference triangulation complete: %s", sfm_dir)
 
@@ -780,6 +790,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--overwrite-matches", action="store_true")
     prepare.add_argument("--skip-geometric-verification", action="store_true")
     prepare.add_argument("--estimate-two-view-geometries", action="store_true")
+    prepare.add_argument("--allow-pose-adjustment", action="store_true")
     prepare.add_argument("--verbose", action="store_true")
     prepare.set_defaults(func=run_prepare_reference)
 
