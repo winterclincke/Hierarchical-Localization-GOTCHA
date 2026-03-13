@@ -4,6 +4,9 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
+# TODO: Deprecate this custom solver once pycolmap exposes camera-center-prior
+# absolute-pose refinement in a released COLMAP/pycolmap version.
+
 
 def compute_center(cam_from_world: Any) -> np.ndarray:
     """Compute camera center in world coordinates from a pycolmap pose."""

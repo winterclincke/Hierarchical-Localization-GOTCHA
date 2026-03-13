@@ -43,18 +43,13 @@ Camera/georeference note:
 python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference --project /path/to/project
 ```
 
-Default behavior:
-- imported reference poses are kept fixed (`--allow-pose-adjustment` is off by default), so an existing ODM mesh can be reused.
+Behavior in this step:
+- imported reference poses are fixed.
+- intrinsics refinement is disabled.
+- this keeps compatibility with reusing an existing ODM mesh reconstruction.
 
-Optional pose adjustment:
-
-```bash
-python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference \
-  --project /path/to/project \
-  --allow-pose-adjustment
-```
-
-If poses are adjusted, re-run downstream dense/mesh reconstruction (MVS) with the updated poses.
+`--allow-pose-adjustment` is kept only for backward CLI compatibility and is intentionally disabled.
+If you run external BA/refinement (for example PixSfM), regenerate downstream dense/MVS mesh so the updated poses stay aligned with the 3D digital twin.
 
 ### Step 3: Localize query images
 
@@ -77,20 +72,28 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --project /path/to/project \
   --gt-center 7.65 2.50 -0.95 \
   --use-fixed-center
-
-# override initial focal length for query cameras
-python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
-  --project /path/to/project \
-  --initial-focal-length 2000
 ```
 
 Per camera/PTZ workflow:
 - run `localize_queries` again with a different single `--gt-center` value.
 
+Localization trials (experimental):
+- This pipeline uses experimental repeated localization trials; they can improve robustness in some scenes but do not guarantee better accuracy.
+- Stage 1 (bootstrap pass): one first pose estimation per query is used to bootstrap focal length (`bootstrap_focal_estimated`).
+- Stage 2 (primary trials): only used when GT center is provided; remaining `LOCALIZATION_TRIALS - 1` runs are evaluated and the best pose is selected by smallest center distance.
+- Stage 3 (fallback trials): only when `--fallback-exhaustive` is enabled and primary localization fails or is weak.
+  Without GT center, fallback runs once.
+  With GT center, fallback uses `FALLBACK_TRIALS`.
+- To simplify/omit most trial behavior: run without `--fallback-exhaustive`, and set `LOCALIZATION_TRIALS=1` (optionally `FALLBACK_TRIALS=1`) in `hloc/pipelines/GOTCHA/pipeline.py`.
+
+Future note:
+- a pending COLMAP/pycolmap release adds camera-center prior support during absolute-pose refinement.
+- after that release, this pipeline can replace the current custom fixed-center solver with the native solver path.
+- if refined poses are adopted, regenerate dense/MVS mesh to keep alignment with the 3D digital twin.
+
 ## Outputs
 
 `localize_queries` writes:
-- `project/outputs/results.txt` (HLOC-compatible pose output)
 - `project/outputs/poses.json` (downstream-friendly per-query records)
 
 Each `poses.json` entry contains:
@@ -98,6 +101,7 @@ Each `poses.json` entry contains:
 - `qvec`, `tvec`
 - `camera` (`model`, `width`, `height`, `f`, `cx`, `cy`, `k`)
 - `inliers`, `center_distance_m`
+- `bootstrap_success`, `bootstrap_focal_initial`, `bootstrap_focal_estimated`
 
 Failed queries are still included with `status: "failed"` and null pose/camera fields.
 

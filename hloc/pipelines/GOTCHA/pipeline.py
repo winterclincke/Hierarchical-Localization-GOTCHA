@@ -18,7 +18,6 @@ from ... import (
     triangulation,
 )
 from ...localize_sfm import QueryLocalizer, pose_from_cluster
-from ...utils.io import write_poses
 from ...utils.parsers import parse_retrieval
 from .fixed_center_solver import compute_center, refine_pose_fixed_center
 from .opensfm_to_empty_rec import create_empty_rec_from_nvm
@@ -37,9 +36,11 @@ MAX_KEYPOINTS = 10000
 NUM_POSE_PAIRS = 35
 ROTATION_THRESHOLD = 120.0
 NUM_MATCHED = 35
+# Experimental heuristic: repeated trials can improve robustness, but gains are scene-dependent.
 LOCALIZATION_TRIALS = 5
+# Experimental heuristic for fallback exhaustive localization.
 FALLBACK_TRIALS = 10
-FALLBACK_MIN_INLIERS = 15
+FALLBACK_MIN_INLIERS = 50
 
 LOCALIZER_CONFIG = {
     "estimation": {
@@ -81,6 +82,25 @@ def get_num_inliers(ret: Optional[Dict[str, Any]]) -> int:
     if "num_inliers" in ret:
         return int(ret["num_inliers"])
     return 0
+
+
+def get_pose_metrics(
+    ret: Dict[str, Any], gt_center: Optional[np.ndarray]
+) -> Dict[str, Any]:
+    inliers = get_num_inliers(ret)
+    center_distance = None
+    if gt_center is not None:
+        center = compute_center(ret["cam_from_world"])
+        center_distance = float(np.linalg.norm(center - gt_center))
+    return {"inliers": int(inliers), "center_distance_m": center_distance}
+
+
+def get_selection_key(
+    metrics: Dict[str, Any], gt_center: Optional[np.ndarray]
+) -> Tuple[float, ...]:
+    if gt_center is not None:
+        return (float(metrics["center_distance_m"]), -int(metrics["inliers"]))
+    return (-int(metrics["inliers"]),)
 
 
 def extract_inlier_correspondences(
@@ -192,23 +212,14 @@ def localize_with_trials(
         if ret is None:
             continue
 
-        inliers = get_num_inliers(ret)
-        center_distance = None
-        if gt_center is not None:
-            center = compute_center(ret["cam_from_world"])
-            center_distance = float(np.linalg.norm(center - gt_center))
-            key = (center_distance, -inliers)
-        else:
-            key = (-inliers,)
+        metrics = get_pose_metrics(ret, gt_center)
+        key = get_selection_key(metrics, gt_center)
 
         if best_key is None or key < best_key:
             best_key = key
             best_ret = ret
             best_log = log
-            best_metrics = {
-                "inliers": int(inliers),
-                "center_distance_m": center_distance,
-            }
+            best_metrics = metrics
 
     return best_ret, best_log, best_metrics
 
@@ -223,6 +234,7 @@ def run_fallback_exhaustive(
     all_ref_db_ids: List[int],
     features_path: Path,
     matches_path: Path,
+    trials: int,
     gt_center: Optional[np.ndarray],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
     fallback_pairs_path = outputs_dir / "fallback_pairs" / f"{query_name.replace('/', '__')}.txt"
@@ -247,7 +259,7 @@ def run_fallback_exhaustive(
         db_ids=all_ref_db_ids,
         features_path=features_path,
         matches_path=matches_path,
-        trials=FALLBACK_TRIALS,
+        trials=trials,
         gt_center=gt_center,
     )
 
@@ -318,43 +330,20 @@ def run_prepare_reference(args: argparse.Namespace) -> None:
         overwrite=False,
     )
 
-    triangulation_options = pycolmap.IncrementalPipelineOptions()
-    if not args.allow_pose_adjustment:
-        missing_attrs = []
-        if hasattr(triangulation_options, "fix_existing_frames"):
-            triangulation_options.fix_existing_frames = True
-        else:
-            missing_attrs.append("IncrementalPipelineOptions.fix_existing_frames")
-
-        if hasattr(triangulation_options, "mapper") and hasattr(
-            triangulation_options.mapper, "fix_existing_frames"
-        ):
-            triangulation_options.mapper.fix_existing_frames = True
-        else:
-            missing_attrs.append("IncrementalPipelineOptions.mapper.fix_existing_frames")
-
-        if hasattr(triangulation_options, "ba_refine_focal_length"):
-            triangulation_options.ba_refine_focal_length = False
-        else:
-            missing_attrs.append("IncrementalPipelineOptions.ba_refine_focal_length")
-
-        if hasattr(triangulation_options, "ba_refine_extra_params"):
-            triangulation_options.ba_refine_extra_params = False
-        else:
-            missing_attrs.append("IncrementalPipelineOptions.ba_refine_extra_params")
-
-        if missing_attrs:
-            raise RuntimeError(
-                "Cannot enforce fixed poses/intrinsics with current pycolmap API. "
-                f"Missing attributes: {', '.join(missing_attrs)}"
-            )
-
-        # TODO: evaluate PixSfM triangulation/refiner integration for improved accuracy.
-        logger.info(
-            "Pose adjustment disabled (default): fixing reference frames and intrinsics."
+    if args.allow_pose_adjustment:
+        raise RuntimeError(
+            "--allow-pose-adjustment is intentionally disabled in prepare_reference. "
+            "For pose refinement, use a dedicated BA/PixSfM workflow and regenerate dense/MVS mesh afterwards "
+            "to keep alignment with the 3D digital twin."
         )
-    else:
-        logger.info("Pose adjustment enabled. Imported reference poses may be refined.")
+
+    triangulation_options = pycolmap.IncrementalPipelineOptions()
+    triangulation_options.fix_existing_frames = True
+    triangulation_options.mapper.fix_existing_frames = True
+    triangulation_options.ba_refine_focal_length = False
+    triangulation_options.ba_refine_extra_params = False
+    # TODO: evaluate PixSfM triangulation/refiner integration for higher-accuracy refinement workflows.
+    logger.info("Fixed-pose reference triangulation: frames and intrinsics are locked.")
 
     triangulation.main(
         sfm_dir=sfm_dir,
@@ -397,7 +386,6 @@ def run_localize_queries(args: argparse.Namespace) -> None:
     matches_path = outputs_dir / "matches.h5"
     global_desc_path = outputs_dir / "global-features.h5"
     pairs_path = outputs_dir / "pairs-query-ref.txt"
-    results_path = outputs_dir / "results.txt"
     poses_json_path = outputs_dir / "poses.json"
 
     ref_list = to_relative_paths(refs, project)
@@ -448,15 +436,16 @@ def run_localize_queries(args: argparse.Namespace) -> None:
 
     gt_center = np.array(args.gt_center, dtype=float) if args.gt_center else None
 
-    final_poses: Dict[str, pycolmap.Rigid3d] = {}
+    localized_count = 0
     pose_records: List[Dict[str, Any]] = []
 
     for query_path in queries:
         query_name = query_path.relative_to(project).as_posix()
 
         camera = pycolmap.infer_camera_from_image(query_path)
-        if args.initial_focal_length is not None:
-            camera.focal_length = float(args.initial_focal_length)
+        bootstrap_focal_initial = float(camera.focal_length)
+        bootstrap_focal_estimated: Optional[float] = None
+        bootstrap_success = False
 
         db_ids = [name_to_id[n] for n in retrieval.get(query_name, []) if n in name_to_id]
         ret = None
@@ -465,19 +454,45 @@ def run_localize_queries(args: argparse.Namespace) -> None:
         pose_source = "primary"
 
         if db_ids:
-            ret, log, metrics = localize_with_trials(
-                localizer=localizer,
-                query_name=query_name,
-                camera=camera,
-                db_ids=db_ids,
-                features_path=features_path,
-                matches_path=matches_path,
-                trials=LOCALIZATION_TRIALS,
-                gt_center=gt_center,
+            bootstrap_ret, bootstrap_log = pose_from_cluster(
+                localizer, query_name, camera, db_ids, features_path, matches_path
             )
+            if bootstrap_ret is not None:
+                bootstrap_success = True
+                bootstrap_metrics = get_pose_metrics(bootstrap_ret, gt_center)
+                bootstrap_focal_estimated = float(
+                    getattr(bootstrap_ret.get("camera", camera), "focal_length", camera.focal_length)
+                )
+                camera.focal_length = bootstrap_focal_estimated
+                ret = bootstrap_ret
+                log = bootstrap_log
+                metrics = bootstrap_metrics
+
+            # Only use repeated primary trials when a GT center is available.
+            if gt_center is not None:
+                remaining_ret, remaining_log, remaining_metrics = localize_with_trials(
+                    localizer=localizer,
+                    query_name=query_name,
+                    camera=camera,
+                    db_ids=db_ids,
+                    features_path=features_path,
+                    matches_path=matches_path,
+                    trials=max(LOCALIZATION_TRIALS - 1, 0),
+                    gt_center=gt_center,
+                )
+                # Keep the best-scoring pose over trials, not simply the first valid estimate.
+                if remaining_ret is not None and (
+                    ret is None
+                    or get_selection_key(remaining_metrics, gt_center)
+                    < get_selection_key(metrics, gt_center)
+                ):
+                    ret = remaining_ret
+                    log = remaining_log
+                    metrics = remaining_metrics
 
         fallback_used = False
         if args.fallback_exhaustive and (ret is None or metrics["inliers"] < FALLBACK_MIN_INLIERS):
+            fallback_trials = FALLBACK_TRIALS if gt_center is not None else 1
             fallback_ret, fallback_log, fallback_metrics = run_fallback_exhaustive(
                 outputs_dir=outputs_dir,
                 query_name=query_name,
@@ -488,6 +503,7 @@ def run_localize_queries(args: argparse.Namespace) -> None:
                 all_ref_db_ids=all_ref_db_ids,
                 features_path=features_path,
                 matches_path=matches_path,
+                trials=fallback_trials,
                 gt_center=gt_center,
             )
             if fallback_ret is not None:
@@ -509,6 +525,9 @@ def run_localize_queries(args: argparse.Namespace) -> None:
                     "inliers": 0,
                     "center_distance_m": None,
                     "fallback_used": fallback_used,
+                    "bootstrap_success": bootstrap_success,
+                    "bootstrap_focal_initial": bootstrap_focal_initial,
+                    "bootstrap_focal_estimated": bootstrap_focal_estimated,
                 }
             )
             continue
@@ -520,6 +539,8 @@ def run_localize_queries(args: argparse.Namespace) -> None:
             inlier_mask = np.asarray(ret.get("inlier_mask", []), dtype=bool)
             points2d, points3d = extract_inlier_correspondences(model, log, inlier_mask)
             if len(points2d) >= 4:
+                # TODO: replace this custom solver once pycolmap exposes center-prior absolute-pose refinement in a stable release.
+                # feature is implemented but not yet exposed (will be available in pycolmap 3.14+): https://github.com/colmap/colmap/pull/4107
                 fixed_ret = refine_pose_fixed_center(
                     points2d=points2d,
                     points3d=points3d,
@@ -544,7 +565,7 @@ def run_localize_queries(args: argparse.Namespace) -> None:
         else:
             selected_camera_dict = camera_to_simple_radial(selected_camera)
 
-        final_poses[query_name] = selected_pose
+        localized_count += 1
         qxyzw = np.asarray(selected_pose.rotation.quat, dtype=float)
         qvec = [float(qxyzw[3]), float(qxyzw[0]), float(qxyzw[1]), float(qxyzw[2])]
         tvec = [float(v) for v in np.asarray(selected_pose.translation, dtype=float).reshape(3)]
@@ -564,15 +585,16 @@ def run_localize_queries(args: argparse.Namespace) -> None:
                 "inliers": int(metrics["inliers"]),
                 "center_distance_m": center_distance_m,
                 "fallback_used": fallback_used,
+                "bootstrap_success": bootstrap_success,
+                "bootstrap_focal_initial": bootstrap_focal_initial,
+                "bootstrap_focal_estimated": bootstrap_focal_estimated,
             }
         )
 
-    write_poses(final_poses, results_path, prepend_camera_name=False)
     with open(poses_json_path, "w", encoding="utf-8") as fh:
         json.dump(pose_records, fh, indent=2)
 
-    logger.info("Localized %d / %d queries.", len(final_poses), len(queries))
-    logger.info("Saved results to %s", results_path)
+    logger.info("Localized %d / %d queries.", localized_count, len(queries))
     logger.info("Saved poses JSON to %s", poses_json_path)
 
 
@@ -586,7 +608,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare = subparsers.add_parser("prepare_reference", help="Triangulate reference points from empty_rec.")
     prepare.add_argument("--project", type=Path, required=True)
-    prepare.add_argument("--allow-pose-adjustment", action="store_true")
+    prepare.add_argument(
+        "--allow-pose-adjustment",
+        action="store_true",
+        help="Deprecated for this workflow: currently disabled and will raise an explicit error.",
+    )
     prepare.set_defaults(func=run_prepare_reference)
 
     localize = subparsers.add_parser("localize_queries", help="Localize query images against sfm_triangulated.")
@@ -594,7 +620,6 @@ def build_parser() -> argparse.ArgumentParser:
     localize.add_argument("--gt-center", nargs=3, type=float)
     localize.add_argument("--use-fixed-center", action="store_true")
     localize.add_argument("--fallback-exhaustive", action="store_true")
-    localize.add_argument("--initial-focal-length", type=float)
     localize.set_defaults(func=run_localize_queries)
 
     return parser
