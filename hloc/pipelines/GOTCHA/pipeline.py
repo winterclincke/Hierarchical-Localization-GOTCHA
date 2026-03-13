@@ -318,10 +318,41 @@ def run_prepare_reference(args: argparse.Namespace) -> None:
         overwrite=False,
     )
 
-    mapper_options: Dict[str, Any] = {}
+    triangulation_options = pycolmap.IncrementalPipelineOptions()
     if not args.allow_pose_adjustment:
-        mapper_options["fix_existing_images"] = True
-        logger.info("Pose adjustment disabled (default). Imported reference poses stay fixed.")
+        missing_attrs = []
+        if hasattr(triangulation_options, "fix_existing_frames"):
+            triangulation_options.fix_existing_frames = True
+        else:
+            missing_attrs.append("IncrementalPipelineOptions.fix_existing_frames")
+
+        if hasattr(triangulation_options, "mapper") and hasattr(
+            triangulation_options.mapper, "fix_existing_frames"
+        ):
+            triangulation_options.mapper.fix_existing_frames = True
+        else:
+            missing_attrs.append("IncrementalPipelineOptions.mapper.fix_existing_frames")
+
+        if hasattr(triangulation_options, "ba_refine_focal_length"):
+            triangulation_options.ba_refine_focal_length = False
+        else:
+            missing_attrs.append("IncrementalPipelineOptions.ba_refine_focal_length")
+
+        if hasattr(triangulation_options, "ba_refine_extra_params"):
+            triangulation_options.ba_refine_extra_params = False
+        else:
+            missing_attrs.append("IncrementalPipelineOptions.ba_refine_extra_params")
+
+        if missing_attrs:
+            raise RuntimeError(
+                "Cannot enforce fixed poses/intrinsics with current pycolmap API. "
+                f"Missing attributes: {', '.join(missing_attrs)}"
+            )
+
+        # TODO: evaluate PixSfM triangulation/refiner integration for improved accuracy.
+        logger.info(
+            "Pose adjustment disabled (default): fixing reference frames and intrinsics."
+        )
     else:
         logger.info("Pose adjustment enabled. Imported reference poses may be refined.")
 
@@ -335,7 +366,7 @@ def run_prepare_reference(args: argparse.Namespace) -> None:
         skip_geometric_verification=False,
         estimate_two_view_geometries=False,
         verbose=False,
-        mapper_options=mapper_options,
+        mapper_options=triangulation_options,
     )
     logger.info("Reference model written to %s", sfm_dir)
 
