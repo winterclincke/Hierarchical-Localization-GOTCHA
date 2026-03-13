@@ -8,36 +8,34 @@
 
 ```text
 project/
-  images/          # reference images
-  queries/         # query images (optionally grouped in subfolders)
-  empty_rec/       # COLMAP model with known reference poses
+  opensfm/
+    undistorted/
+      reconstruction.nvm
+  images/          # undistorted reference images
+  queries/         # query images (optional subfolders)
+  empty_rec/       # generated COLMAP known-pose model
   outputs/         # generated outputs
 ```
 
 ## Chronological workflow
 
-### Step 1: Import from ODM/OpenSfM
+### Step 1: Import from ODM/OpenSfM and build `empty_rec`
 
-Use the ODM/OpenSfM undistorted reference images as `project/images` (copy or symlink).
-
-`prepare_empty_rec` uses fixed project-layout paths:
-- `project/opensfm/undistorted/reconstruction.nvm`
-- `project/images`
-
-The `reconstruction.nvm` file and the images in `project/images` must correspond.
+1. Copy/symlink ODM/OpenSfM undistorted images into `project/images`.
+2. Place the matching NVM file at `project/opensfm/undistorted/reconstruction.nvm`.
+3. Run:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline prepare_empty_rec --project /path/to/project
 ```
 
-Output of this step:
+This creates:
 - `project/empty_rec/cameras.txt`, `images.txt`, `points3D.txt`
 - `project/empty_rec/cameras.bin`, `images.bin`, `points3D.bin`
 
 Camera/georeference note:
-- `prepare_empty_rec` writes one shared `SIMPLE_RADIAL` camera (single-camera assumption).
-- It does not create georeferencing by itself; it preserves the OpenSfM/ODM reference frame.
-- If your ODM reconstruction is georeferenced (depending on your ODM setup, e.g. GPS/RTK/calibration), `empty_rec` follows that frame.
+- `prepare_empty_rec` uses one shared `SIMPLE_RADIAL` camera (single-camera assumption).
+- Georeferencing is not created by this step; it follows the OpenSfM/ODM frame from `reconstruction.nvm`.
 
 ### Step 2: Triangulate reference points
 
@@ -45,12 +43,10 @@ Camera/georeference note:
 python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference --project /path/to/project
 ```
 
-Default behavior in this step:
-- Imported reference poses are kept fixed (pose adjustment disabled by default).
-- This default is intended to keep compatibility with reusing an existing ODM mesh reconstruction.
+Default behavior:
+- imported reference poses are kept fixed (`--allow-pose-adjustment` is off by default), so an existing ODM mesh can be reused.
 
-Optional:
-- Enable pose adjustment/refinement with:
+Optional pose adjustment:
 
 ```bash
 python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference \
@@ -58,7 +54,7 @@ python3 -m hloc.pipelines.GOTCHA.pipeline prepare_reference \
   --allow-pose-adjustment
 ```
 
-- If you enable pose adjustment/refinement, re-run downstream dense/mesh reconstruction (MVS) with updated poses for consistency.
+If poses are adjusted, re-run downstream dense/mesh reconstruction (MVS) with the updated poses.
 
 ### Step 3: Localize query images
 
@@ -69,52 +65,45 @@ python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries --project /path/to/pr
 ```
 
 Common options:
-- Fallback exhaustive:
 
 ```bash
+# enable exhaustive fallback when retrieval localization is weak/failing
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --project /path/to/project \
   --fallback-exhaustive
-```
 
-- Single GT center value:
-
-```bash
+# use one GT center for this run and apply fixed-center refinement
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --project /path/to/project \
   --gt-center 7.65 2.50 -0.95 \
   --use-fixed-center
-```
 
-- Per camera/PTZ workflow:
-  run `localize_queries` again with a different `--gt-center` value for each known camera position.
-
-- Manual query-reference pairs:
-
-```bash
+# override initial focal length for query cameras
 python3 -m hloc.pipelines.GOTCHA.pipeline localize_queries \
   --project /path/to/project \
-  --manual-pairs /path/to/query-pairs.txt
+  --initial-focal-length 2000
 ```
+
+Per camera/PTZ workflow:
+- run `localize_queries` again with a different single `--gt-center` value.
 
 ## Outputs
 
 `localize_queries` writes:
-- `project/outputs/results.txt`
-- `project/outputs/cameras_extra.txt`
-- `project/outputs/images_extra.txt`
-- `project/outputs/query_summary.json`
+- `project/outputs/results.txt` (HLOC-compatible pose output)
+- `project/outputs/poses.json` (downstream-friendly per-query records)
 
-`query_summary.json` includes per query:
-- status
-- inliers
-- center distance (if GT center is available)
-- fallback usage
-- reprojection stats for fixed-center refinement (if enabled)
+Each `poses.json` entry contains:
+- `query`, `status`, `pose_source`
+- `qvec`, `tvec`
+- `camera` (`model`, `width`, `height`, `f`, `cx`, `cy`, `k`)
+- `inliers`, `center_distance_m`
+
+Failed queries are still included with `status: "failed"` and null pose/camera fields.
 
 ## Assumptions
 
-- Single camera setup for the full dataset.
-- A valid OpenSfM/ODM NVM file exists at `project/opensfm/undistorted/reconstruction.nvm`.
-- `project/images` contains the same images as the NVM with unique basenames.
-- `points3D` in `empty_rec` is intentionally empty.
+- Single-camera dataset.
+- Valid OpenSfM/ODM NVM file at `project/opensfm/undistorted/reconstruction.nvm`.
+- `project/images` corresponds to the NVM images (unique basenames).
+- `empty_rec` intentionally has no 3D points.

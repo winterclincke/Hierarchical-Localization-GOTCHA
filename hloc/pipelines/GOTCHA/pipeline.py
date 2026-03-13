@@ -18,6 +18,7 @@ from ... import (
     triangulation,
 )
 from ...localize_sfm import QueryLocalizer, pose_from_cluster
+from ...utils.io import write_poses
 from ...utils.parsers import parse_retrieval
 from .fixed_center_solver import compute_center, refine_pose_fixed_center
 from .opensfm_to_empty_rec import create_empty_rec_from_nvm
@@ -25,7 +26,39 @@ from .opensfm_to_empty_rec import create_empty_rec_from_nvm
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 DEFAULT_OPENSFM_NVM = Path("opensfm/undistorted/reconstruction.nvm")
 DEFAULT_REFERENCE_IMAGES = Path("images")
+DEFAULT_QUERY_IMAGES = Path("queries")
 DEFAULT_EMPTY_REC_DIR = Path("empty_rec")
+DEFAULT_OUTPUT_DIR = Path("outputs")
+
+LOCAL_FEATURE_CONF = "superpoint_max"
+GLOBAL_FEATURE_CONF = "netvlad"
+MATCHER_CONF = "superpoint+lightglue"
+MAX_KEYPOINTS = 10000
+NUM_POSE_PAIRS = 35
+ROTATION_THRESHOLD = 120.0
+NUM_MATCHED = 35
+LOCALIZATION_TRIALS = 5
+FALLBACK_TRIALS = 10
+FALLBACK_MIN_INLIERS = 15
+
+LOCALIZER_CONFIG = {
+    "estimation": {
+        "ransac": {
+            "max_error": 12.0,
+            "confidence": 0.99,
+            "min_inlier_ratio": 0.3,
+            "min_num_trials": 100,
+            "max_num_trials": 20000,
+        },
+        "estimate_focal_length": False,
+    },
+    "refinement": {
+        "max_num_iterations": 10000,
+        "refine_focal_length": True,
+        "refine_extra_params": False,
+        "print_summary": False,
+    },
+}
 
 
 def list_images(root: Path) -> List[Path]:
@@ -40,22 +73,6 @@ def to_relative_paths(paths: List[Path], project: Path) -> List[str]:
     return [p.relative_to(project).as_posix() for p in paths]
 
 
-def sanitize_filename(value: str) -> str:
-    sanitized = value.replace("/", "__").replace("\\", "__").replace(" ", "_")
-    return sanitized.replace(":", "_")
-
-
-def resolve_optional_path(path: Path, project: Path) -> Path:
-    if path.is_absolute():
-        return path
-    candidate = project / path
-    return candidate if candidate.exists() else path
-
-
-def get_query_name(query_path: Path, project: Path) -> str:
-    return query_path.relative_to(project).as_posix()
-
-
 def get_num_inliers(ret: Optional[Dict[str, Any]]) -> int:
     if ret is None:
         return 0
@@ -66,9 +83,40 @@ def get_num_inliers(ret: Optional[Dict[str, Any]]) -> int:
     return 0
 
 
-def get_simple_radial_params(
-    camera: pycolmap.Camera, focal_override: Optional[float] = None
-) -> Tuple[float, float, float, float]:
+def extract_inlier_correspondences(
+    model: pycolmap.Reconstruction,
+    log: Dict[str, Any],
+    inlier_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    keypoints = np.asarray(log.get("keypoints_query", []), dtype=float)
+    point3d_ids = np.asarray(log.get("points3D_ids", []), dtype=np.int64)
+    inlier_mask = np.asarray(inlier_mask, dtype=bool)
+
+    n = min(len(keypoints), len(point3d_ids), len(inlier_mask))
+    if n == 0:
+        return np.zeros((0, 2), dtype=float), np.zeros((0, 3), dtype=float)
+
+    keypoints = keypoints[:n]
+    point3d_ids = point3d_ids[:n]
+    inlier_mask = inlier_mask[:n]
+    selected = inlier_mask & (point3d_ids != -1)
+    if not np.any(selected):
+        return np.zeros((0, 2), dtype=float), np.zeros((0, 3), dtype=float)
+
+    points2d = []
+    points3d = []
+    for p2d, pid in zip(keypoints[selected], point3d_ids[selected]):
+        pid_int = int(pid)
+        if pid_int in model.points3D:
+            points2d.append(p2d)
+            points3d.append(model.points3D[pid_int].xyz)
+
+    if not points2d:
+        return np.zeros((0, 2), dtype=float), np.zeros((0, 3), dtype=float)
+    return np.asarray(points2d, dtype=float), np.asarray(points3d, dtype=float)
+
+
+def camera_to_simple_radial(camera: pycolmap.Camera, focal_override: Optional[float] = None) -> Dict[str, Any]:
     params = list(np.asarray(camera.params, dtype=float)) if hasattr(camera, "params") else []
     focal = float(
         focal_override
@@ -90,86 +138,36 @@ def get_simple_radial_params(
         )
     )
     k = float(params[3]) if len(params) > 3 else 0.0
-    return focal, cx, cy, k
+    return {
+        "model": "SIMPLE_RADIAL",
+        "width": int(camera.width),
+        "height": int(camera.height),
+        "f": focal,
+        "cx": cx,
+        "cy": cy,
+        "k": k,
+    }
 
 
-def write_camera_line(
-    handle, camera_id: int, width: int, height: int, focal: float, cx: float, cy: float, k: float
-) -> None:
-    handle.write(
-        f"{camera_id} SIMPLE_RADIAL {width} {height} {focal} {cx} {cy} {k}\n"
-    )
+def rigid3d_from_rt(rotation_matrix: np.ndarray, translation_vector: np.ndarray) -> pycolmap.Rigid3d:
+    rotation_matrix = np.asarray(rotation_matrix, dtype=float).reshape(3, 3)
+    translation_vector = np.asarray(translation_vector, dtype=float).reshape(3)
 
+    try:
+        return pycolmap.Rigid3d(pycolmap.Rotation3d(rotation_matrix), translation_vector)
+    except Exception:
+        pass
 
-def write_image_line_from_pose(
-    handle, image_id: int, pose: pycolmap.Rigid3d, camera_id: int, image_name: str
-) -> None:
-    quat_xyzw = np.asarray(pose.rotation.quat, dtype=float)
-    qw, qx, qy, qz = quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]
-    tx, ty, tz = np.asarray(pose.translation, dtype=float)
-    handle.write(
-        f"{image_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} {camera_id} {image_name}\n\n"
-    )
-
-
-def write_image_line_from_rt(
-    handle,
-    image_id: int,
-    rotation_matrix: np.ndarray,
-    translation_vector: np.ndarray,
-    camera_id: int,
-    image_name: str,
-) -> None:
     quat_xyzw = ScipyRotation.from_matrix(rotation_matrix).as_quat()
-    qw, qx, qy, qz = quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]
-    tx, ty, tz = np.asarray(translation_vector, dtype=float).reshape(3)
-    handle.write(
-        f"{image_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} {camera_id} {image_name}\n\n"
-    )
+    try:
+        return pycolmap.Rigid3d(pycolmap.Rotation3d(quat_xyzw), translation_vector)
+    except Exception:
+        pass
 
-
-def write_results_file(poses: Dict[str, pycolmap.Rigid3d], output_path: Path) -> None:
-    with open(output_path, "w", encoding="utf-8") as handle:
-        for query_name in sorted(poses.keys()):
-            pose = poses[query_name]
-            quat_xyzw = np.asarray(pose.rotation.quat, dtype=float)
-            qw, qx, qy, qz = quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]
-            tx, ty, tz = np.asarray(pose.translation, dtype=float).reshape(3)
-            handle.write(f"{query_name} {qw} {qx} {qy} {qz} {tx} {ty} {tz}\n")
-
-
-def extract_inlier_correspondences(
-    model: pycolmap.Reconstruction,
-    log: Dict[str, Any],
-    inlier_mask: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    keypoints = np.asarray(log.get("keypoints_query", []), dtype=float)
-    point3d_ids = np.asarray(log.get("points3D_ids", []), dtype=np.int64)
-    inlier_mask = np.asarray(inlier_mask, dtype=bool)
-
-    n = min(len(keypoints), len(point3d_ids), len(inlier_mask))
-    if n == 0:
-        return np.zeros((0, 2), dtype=float), np.zeros((0, 3), dtype=float)
-
-    keypoints = keypoints[:n]
-    point3d_ids = point3d_ids[:n]
-    inlier_mask = inlier_mask[:n]
-
-    selected = inlier_mask & (point3d_ids != -1)
-    if not np.any(selected):
-        return np.zeros((0, 2), dtype=float), np.zeros((0, 3), dtype=float)
-
-    points2d_out = []
-    points3d_out = []
-    for p2d, pid in zip(keypoints[selected], point3d_ids[selected]):
-        pid_int = int(pid)
-        if pid_int in model.points3D:
-            points2d_out.append(p2d)
-            points3d_out.append(model.points3D[pid_int].xyz)
-
-    if not points2d_out:
-        return np.zeros((0, 2), dtype=float), np.zeros((0, 3), dtype=float)
-    return np.asarray(points2d_out, dtype=float), np.asarray(points3d_out, dtype=float)
+    try:
+        return pycolmap.Rigid3d(rotation_matrix, translation_vector)
+    except Exception as exc:
+        raise RuntimeError("Failed to convert fixed-center pose to pycolmap.Rigid3d.") from exc
 
 
 def localize_with_trials(
@@ -182,10 +180,10 @@ def localize_with_trials(
     trials: int,
     gt_center: Optional[np.ndarray],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
-    best_ret: Optional[Dict[str, Any]] = None
-    best_log: Optional[Dict[str, Any]] = None
+    best_ret = None
+    best_log = None
     best_key = None
-    best_metrics: Dict[str, Any] = {"num_inliers": 0, "center_distance_m": None}
+    best_metrics = {"inliers": 0, "center_distance_m": None}
 
     for _ in range(trials):
         ret, log = pose_from_cluster(
@@ -194,25 +192,22 @@ def localize_with_trials(
         if ret is None:
             continue
 
-        num_inliers = get_num_inliers(ret)
-        center = compute_center(ret["cam_from_world"])
-        center_distance = (
-            float(np.linalg.norm(center - gt_center)) if gt_center is not None else None
-        )
-
+        inliers = get_num_inliers(ret)
+        center_distance = None
         if gt_center is not None:
-            current_key = (center_distance, -num_inliers)
+            center = compute_center(ret["cam_from_world"])
+            center_distance = float(np.linalg.norm(center - gt_center))
+            key = (center_distance, -inliers)
         else:
-            current_key = (-num_inliers,)
+            key = (-inliers,)
 
-        if best_key is None or current_key < best_key:
-            best_key = current_key
+        if best_key is None or key < best_key:
+            best_key = key
             best_ret = ret
             best_log = log
             best_metrics = {
-                "num_inliers": int(num_inliers),
+                "inliers": int(inliers),
                 "center_distance_m": center_distance,
-                "center": center.tolist(),
             }
 
     return best_ret, best_log, best_metrics
@@ -220,23 +215,23 @@ def localize_with_trials(
 
 def run_fallback_exhaustive(
     outputs_dir: Path,
-    matcher_conf: Dict[str, Any],
     query_name: str,
     ref_list: List[str],
+    matcher_conf: Dict[str, Any],
     localizer: QueryLocalizer,
     camera: pycolmap.Camera,
     all_ref_db_ids: List[int],
     features_path: Path,
     matches_path: Path,
-    trials: int,
     gt_center: Optional[np.ndarray],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
-    fallback_pairs_dir = outputs_dir / "fallback_pairs"
-    fallback_pairs_dir.mkdir(parents=True, exist_ok=True)
-    fallback_pairs_path = fallback_pairs_dir / f"{sanitize_filename(query_name)}.txt"
+    fallback_pairs_path = outputs_dir / "fallback_pairs" / f"{query_name.replace('/', '__')}.txt"
+    fallback_pairs_path.parent.mkdir(parents=True, exist_ok=True)
 
     pairs_from_exhaustive.main(
-        output=fallback_pairs_path, image_list=[query_name], ref_list=ref_list
+        output=fallback_pairs_path,
+        image_list=[query_name],
+        ref_list=ref_list,
     )
     match_features.main(
         matcher_conf,
@@ -252,60 +247,40 @@ def run_fallback_exhaustive(
         db_ids=all_ref_db_ids,
         features_path=features_path,
         matches_path=matches_path,
-        trials=trials,
+        trials=FALLBACK_TRIALS,
         gt_center=gt_center,
     )
 
 
-def build_localizer_config(args: argparse.Namespace) -> Dict[str, Any]:
-    return {
-        "estimation": {
-            "ransac": {
-                "max_error": args.ransac_max_error,
-                "confidence": args.ransac_confidence,
-                "min_inlier_ratio": args.ransac_min_inlier_ratio,
-                "min_num_trials": args.ransac_min_num_trials,
-                "max_num_trials": args.ransac_max_num_trials,
-            },
-            "estimate_focal_length": False,
-        },
-        "refinement": {
-            "max_num_iterations": args.refine_max_num_iterations,
-            "refine_focal_length": True,
-            "refine_extra_params": False,
-            "print_summary": False,
-        },
-    }
-
-
 def run_prepare_empty_rec(args: argparse.Namespace) -> None:
     project = args.project.resolve()
-    images_dir = project / DEFAULT_REFERENCE_IMAGES
-    output_empty_rec = project / DEFAULT_EMPTY_REC_DIR
     nvm_path = project / DEFAULT_OPENSFM_NVM
-
     if not nvm_path.exists():
         raise FileNotFoundError(
-            "Missing OpenSfM/ODM reconstruction file at fixed location: "
-            f"{nvm_path}. Expected: project/opensfm/undistorted/reconstruction.nvm"
+            f"Missing NVM file: {nvm_path}. Expected at project/opensfm/undistorted/reconstruction.nvm"
         )
-    create_empty_rec_from_nvm(project, images_dir, output_empty_rec, nvm_path)
+    create_empty_rec_from_nvm(
+        project=project,
+        images_dir=project / DEFAULT_REFERENCE_IMAGES,
+        output_dir=project / DEFAULT_EMPTY_REC_DIR,
+        nvm_path=nvm_path,
+    )
 
 
 def run_prepare_reference(args: argparse.Namespace) -> None:
     project = args.project.resolve()
-    images_dir = project / "images"
-    empty_rec_dir = project / "empty_rec"
-    outputs_dir = project / "outputs"
+    images_dir = project / DEFAULT_REFERENCE_IMAGES
+    empty_rec_dir = project / DEFAULT_EMPTY_REC_DIR
+    outputs_dir = project / DEFAULT_OUTPUT_DIR
 
     if not images_dir.exists():
-        raise FileNotFoundError(f"Missing reference images directory: {images_dir}")
+        raise FileNotFoundError(f"Missing directory: {images_dir}")
     if not empty_rec_dir.exists():
-        raise FileNotFoundError(f"Missing empty reconstruction directory: {empty_rec_dir}")
+        raise FileNotFoundError(f"Missing directory: {empty_rec_dir}")
 
     refs = list_images(images_dir)
     if not refs:
-        raise ValueError(f"No reference images found under {images_dir}")
+        raise ValueError(f"No reference images found in {images_dir}")
 
     outputs_dir.mkdir(parents=True, exist_ok=True)
     features_path = outputs_dir / "features.h5"
@@ -314,43 +289,41 @@ def run_prepare_reference(args: argparse.Namespace) -> None:
     sfm_dir = outputs_dir / "sfm_triangulated"
 
     ref_list = to_relative_paths(refs, project)
-    logger.info("Preparing reference model with %d reference images.", len(ref_list))
 
-    feature_conf = copy.deepcopy(extract_features.confs[args.local_feature_conf])
+    feature_conf = copy.deepcopy(extract_features.confs[LOCAL_FEATURE_CONF])
     if "model" in feature_conf and "max_keypoints" in feature_conf["model"]:
-        feature_conf["model"]["max_keypoints"] = args.max_keypoints
+        feature_conf["model"]["max_keypoints"] = MAX_KEYPOINTS
+
     extract_features.main(
         feature_conf,
         project,
         image_list=ref_list,
         feature_path=features_path,
-        overwrite=args.overwrite_features,
+        overwrite=False,
     )
 
     pairs_from_poses.main(
         empty_rec_dir,
         pairs_path,
-        num_matched=args.num_pose_pairs,
-        rotation_threshold=args.rotation_threshold,
+        num_matched=NUM_POSE_PAIRS,
+        rotation_threshold=ROTATION_THRESHOLD,
     )
 
-    matcher_conf = match_features.confs[args.matcher_conf]
+    matcher_conf = match_features.confs[MATCHER_CONF]
     match_features.main(
         matcher_conf,
         pairs_path,
         features=features_path,
         matches=matches_path,
-        overwrite=args.overwrite_matches,
+        overwrite=False,
     )
 
     mapper_options: Dict[str, Any] = {}
     if not args.allow_pose_adjustment:
         mapper_options["fix_existing_images"] = True
-        logger.info(
-            "Pose adjustment is disabled (default): keeping imported reference poses fixed."
-        )
+        logger.info("Pose adjustment disabled (default). Imported reference poses stay fixed.")
     else:
-        logger.info("Pose adjustment is enabled: triangulation may refine reference poses.")
+        logger.info("Pose adjustment enabled. Imported reference poses may be refined.")
 
     triangulation.main(
         sfm_dir=sfm_dir,
@@ -359,37 +332,34 @@ def run_prepare_reference(args: argparse.Namespace) -> None:
         pairs=pairs_path,
         features=features_path,
         matches=matches_path,
-        skip_geometric_verification=args.skip_geometric_verification,
-        estimate_two_view_geometries=args.estimate_two_view_geometries,
-        verbose=args.verbose,
+        skip_geometric_verification=False,
+        estimate_two_view_geometries=False,
+        verbose=False,
         mapper_options=mapper_options,
     )
-    logger.info("Reference triangulation complete: %s", sfm_dir)
+    logger.info("Reference model written to %s", sfm_dir)
 
 
 def run_localize_queries(args: argparse.Namespace) -> None:
     project = args.project.resolve()
-    images_dir = project / "images"
-    queries_dir = project / "queries"
-    outputs_dir = project / "outputs"
+    images_dir = project / DEFAULT_REFERENCE_IMAGES
+    queries_dir = project / DEFAULT_QUERY_IMAGES
+    outputs_dir = project / DEFAULT_OUTPUT_DIR
     sfm_dir = outputs_dir / "sfm_triangulated"
 
     if not images_dir.exists():
-        raise FileNotFoundError(f"Missing reference images directory: {images_dir}")
+        raise FileNotFoundError(f"Missing directory: {images_dir}")
     if not queries_dir.exists():
-        raise FileNotFoundError(f"Missing query images directory: {queries_dir}")
+        raise FileNotFoundError(f"Missing directory: {queries_dir}")
     if not sfm_dir.exists():
-        raise FileNotFoundError(
-            f"Missing triangulated reference model: {sfm_dir}. "
-            "Run prepare_reference first."
-        )
+        raise FileNotFoundError(f"Missing model: {sfm_dir}. Run prepare_reference first.")
 
     refs = list_images(images_dir)
     queries = list_images(queries_dir)
     if not refs:
-        raise ValueError(f"No reference images found under {images_dir}")
+        raise ValueError(f"No reference images found in {images_dir}")
     if not queries:
-        raise ValueError(f"No query images found under {queries_dir}")
+        raise ValueError(f"No query images found in {queries_dir}")
 
     outputs_dir.mkdir(parents=True, exist_ok=True)
     features_path = outputs_dir / "features.h5"
@@ -397,348 +367,203 @@ def run_localize_queries(args: argparse.Namespace) -> None:
     global_desc_path = outputs_dir / "global-features.h5"
     pairs_path = outputs_dir / "pairs-query-ref.txt"
     results_path = outputs_dir / "results.txt"
-    extra_cams_path = outputs_dir / "cameras_extra.txt"
-    extra_images_path = outputs_dir / "images_extra.txt"
-    summary_path = outputs_dir / "query_summary.json"
+    poses_json_path = outputs_dir / "poses.json"
 
     ref_list = to_relative_paths(refs, project)
     query_list = to_relative_paths(queries, project)
 
-    logger.info("Found %d references and %d queries.", len(ref_list), len(query_list))
-
-    feature_conf = copy.deepcopy(extract_features.confs[args.local_feature_conf])
+    feature_conf = copy.deepcopy(extract_features.confs[LOCAL_FEATURE_CONF])
     if "model" in feature_conf and "max_keypoints" in feature_conf["model"]:
-        feature_conf["model"]["max_keypoints"] = args.max_keypoints
-
-    local_feature_images = query_list
-    if args.ensure_ref_features or not features_path.exists():
-        local_feature_images = ref_list + query_list
-
+        feature_conf["model"]["max_keypoints"] = MAX_KEYPOINTS
     extract_features.main(
         feature_conf,
         project,
-        image_list=local_feature_images,
+        image_list=ref_list + query_list,
         feature_path=features_path,
-        overwrite=args.overwrite_features,
+        overwrite=False,
     )
 
-    if args.manual_pairs is not None:
-        pairs_path = resolve_optional_path(args.manual_pairs, project)
-        if not pairs_path.exists():
-            raise FileNotFoundError(f"Manual pairs file not found: {pairs_path}")
-        retrieval = parse_retrieval(pairs_path)
-        logger.info("Using manual query-reference pairs from %s", pairs_path)
-    else:
-        global_conf = copy.deepcopy(extract_features.confs[args.global_feature_conf])
-        extract_features.main(
-            global_conf,
-            project,
-            image_list=query_list + ref_list,
-            feature_path=global_desc_path,
-            overwrite=args.overwrite_global_descriptors,
-        )
-        pairs_from_retrieval.main(
-            descriptors=global_desc_path,
-            output=pairs_path,
-            num_matched=args.num_matched,
-            query_list=query_list,
-            db_list=ref_list,
-        )
-        retrieval = parse_retrieval(pairs_path)
-        logger.info("Generated retrieval pairs in %s", pairs_path)
+    extract_features.main(
+        extract_features.confs[GLOBAL_FEATURE_CONF],
+        project,
+        image_list=query_list + ref_list,
+        feature_path=global_desc_path,
+        overwrite=False,
+    )
 
-    matcher_conf = match_features.confs[args.matcher_conf]
+    pairs_from_retrieval.main(
+        descriptors=global_desc_path,
+        output=pairs_path,
+        num_matched=NUM_MATCHED,
+        query_list=query_list,
+        db_list=ref_list,
+    )
+    retrieval = parse_retrieval(pairs_path)
+
+    matcher_conf = match_features.confs[MATCHER_CONF]
     match_features.main(
         matcher_conf,
         pairs_path,
         features=features_path,
         matches=matches_path,
-        overwrite=args.overwrite_matches,
+        overwrite=False,
     )
 
     model = pycolmap.Reconstruction(sfm_dir)
-    localizer = QueryLocalizer(model, build_localizer_config(args))
+    localizer = QueryLocalizer(model, LOCALIZER_CONFIG)
 
     name_to_id = {image.name: image_id for image_id, image in model.images.items()}
     all_ref_db_ids = [name_to_id[name] for name in ref_list if name in name_to_id]
-    if not all_ref_db_ids:
-        raise ValueError("No reference image names from project/images were found in sfm model.")
 
-    gt_center_global = np.array(args.gt_center, dtype=float) if args.gt_center else None
+    gt_center = np.array(args.gt_center, dtype=float) if args.gt_center else None
 
-    localized_raw_poses: Dict[str, pycolmap.Rigid3d] = {}
-    summary: List[Dict[str, Any]] = []
+    final_poses: Dict[str, pycolmap.Rigid3d] = {}
+    pose_records: List[Dict[str, Any]] = []
 
-    cam_id = 1
-    image_id = 1
-    with open(extra_cams_path, "w", encoding="utf-8") as cam_fh, open(
-        extra_images_path, "w", encoding="utf-8"
-    ) as img_fh:
-        for query_path in queries:
-            query_name = get_query_name(query_path, project)
-            query_gt_center = gt_center_global
+    for query_path in queries:
+        query_name = query_path.relative_to(project).as_posix()
 
-            camera = pycolmap.infer_camera_from_image(query_path)
-            if args.initial_focal_length is not None:
-                camera.focal_length = float(args.initial_focal_length)
+        camera = pycolmap.infer_camera_from_image(query_path)
+        if args.initial_focal_length is not None:
+            camera.focal_length = float(args.initial_focal_length)
 
-            db_names = retrieval.get(query_name, [])
-            db_ids = [name_to_id[n] for n in db_names if n in name_to_id]
+        db_ids = [name_to_id[n] for n in retrieval.get(query_name, []) if n in name_to_id]
+        ret = None
+        log = None
+        metrics = {"inliers": 0, "center_distance_m": None}
+        pose_source = "primary"
 
-            primary_ret = None
-            primary_log = None
-            primary_metrics = {"num_inliers": 0, "center_distance_m": None}
-            if db_ids:
-                primary_ret, primary_log, primary_metrics = localize_with_trials(
-                    localizer=localizer,
-                    query_name=query_name,
-                    camera=camera,
-                    db_ids=db_ids,
-                    features_path=features_path,
-                    matches_path=matches_path,
-                    trials=args.trials,
-                    gt_center=query_gt_center,
-                )
-
-            selected_ret = primary_ret
-            selected_log = primary_log
-            selected_metrics = primary_metrics
-            selected_source = "primary"
-
-            fallback_attempted = False
-            fallback_used = False
-            fallback_success = False
-            fallback_reason = None
-
-            needs_fallback = (
-                args.fallback_exhaustive
-                and (selected_ret is None or get_num_inliers(selected_ret) < args.fallback_min_inliers)
-            )
-            if needs_fallback:
-                fallback_attempted = True
-                if not all_ref_db_ids:
-                    fallback_reason = "no_reference_db_ids"
-                else:
-                    fallback_ret, fallback_log, fallback_metrics = run_fallback_exhaustive(
-                        outputs_dir=outputs_dir,
-                        matcher_conf=matcher_conf,
-                        query_name=query_name,
-                        ref_list=ref_list,
-                        localizer=localizer,
-                        camera=camera,
-                        all_ref_db_ids=all_ref_db_ids,
-                        features_path=features_path,
-                        matches_path=matches_path,
-                        trials=args.fallback_trials,
-                        gt_center=query_gt_center,
-                    )
-                    if fallback_ret is not None:
-                        selected_ret = fallback_ret
-                        selected_log = fallback_log
-                        selected_metrics = fallback_metrics
-                        selected_source = "fallback"
-                        fallback_used = True
-                        fallback_success = True
-                    else:
-                        fallback_reason = "no_fallback_solution"
-
-            if selected_ret is None or selected_log is None:
-                logger.warning("Failed to localize %s", query_name)
-                summary.append(
-                    {
-                        "query": query_name,
-                        "status": "failed",
-                        "source": "none",
-                        "inliers": 0,
-                        "center_distance_m": None,
-                        "fallback_attempted": fallback_attempted,
-                        "fallback_used": fallback_used,
-                        "fallback_success": fallback_success,
-                        "fallback_reason": fallback_reason,
-                        "reprojection_stats": None,
-                    }
-                )
-                continue
-
-            pose = selected_ret["cam_from_world"]
-            localized_raw_poses[query_name] = pose
-            inliers = get_num_inliers(selected_ret)
-            center = compute_center(pose)
-            center_distance_m = (
-                float(np.linalg.norm(center - query_gt_center))
-                if query_gt_center is not None
-                else None
+        if db_ids:
+            ret, log, metrics = localize_with_trials(
+                localizer=localizer,
+                query_name=query_name,
+                camera=camera,
+                db_ids=db_ids,
+                features_path=features_path,
+                matches_path=matches_path,
+                trials=LOCALIZATION_TRIALS,
+                gt_center=gt_center,
             )
 
-            raw_camera = selected_ret.get("camera", camera)
-            raw_f, raw_cx, raw_cy, raw_k = get_simple_radial_params(raw_camera)
-            raw_width, raw_height = int(raw_camera.width), int(raw_camera.height)
-            raw_cam_id = cam_id
-            raw_img_id = image_id
-            cam_id += 1
-            image_id += 1
-            write_camera_line(
-                cam_fh, raw_cam_id, raw_width, raw_height, raw_f, raw_cx, raw_cy, raw_k
+        fallback_used = False
+        if args.fallback_exhaustive and (ret is None or metrics["inliers"] < FALLBACK_MIN_INLIERS):
+            fallback_ret, fallback_log, fallback_metrics = run_fallback_exhaustive(
+                outputs_dir=outputs_dir,
+                query_name=query_name,
+                ref_list=ref_list,
+                matcher_conf=matcher_conf,
+                localizer=localizer,
+                camera=camera,
+                all_ref_db_ids=all_ref_db_ids,
+                features_path=features_path,
+                matches_path=matches_path,
+                gt_center=gt_center,
             )
-            write_image_line_from_pose(
-                img_fh, raw_img_id, pose, raw_cam_id, f"{query_name}_raw"
-            )
+            if fallback_ret is not None:
+                fallback_used = True
+                ret = fallback_ret
+                log = fallback_log
+                metrics = fallback_metrics
+                pose_source = "fallback"
 
-            fixed_result = None
-            if args.use_fixed_center and query_gt_center is not None:
-                inlier_mask = np.asarray(selected_ret.get("inlier_mask", []), dtype=bool)
-                points2d_inliers, points3d_inliers = extract_inlier_correspondences(
-                    model=model, log=selected_log, inlier_mask=inlier_mask
-                )
-                if len(points2d_inliers) >= 4:
-                    fixed_result = refine_pose_fixed_center(
-                        points2d=points2d_inliers,
-                        points3d=points3d_inliers,
-                        camera=raw_camera,
-                        fixed_center=query_gt_center,
-                        initial_rotation=pose.rotation.matrix(),
-                        initial_translation=np.asarray(pose.translation, dtype=float),
-                        optimize_focal=not args.keep_focal_fixed,
-                        max_nfev=args.fixed_center_max_nfev,
-                    )
-
-                    if fixed_result["success"]:
-                        fixed_f = (
-                            float(raw_f)
-                            if args.keep_focal_fixed
-                            else float(fixed_result["focal_length"])
-                        )
-                        fixed_cam_id = cam_id
-                        fixed_img_id = image_id
-                        cam_id += 1
-                        image_id += 1
-                        write_camera_line(
-                            cam_fh,
-                            fixed_cam_id,
-                            raw_width,
-                            raw_height,
-                            fixed_f,
-                            raw_cx,
-                            raw_cy,
-                            raw_k,
-                        )
-                        write_image_line_from_rt(
-                            img_fh,
-                            fixed_img_id,
-                            fixed_result["rotation_matrix"],
-                            fixed_result["translation_vector"],
-                            fixed_cam_id,
-                            f"{query_name}_fixed",
-                        )
-
-            reprojection_stats = None
-            if fixed_result is not None:
-                initial = float(fixed_result["reproj_error_initial"])
-                optimized = float(fixed_result["mean_reprojection_error"])
-                change_pct = (
-                    100.0 * (optimized - initial) / initial
-                    if np.isfinite(initial) and initial > 0.0
-                    else None
-                )
-                reprojection_stats = {
-                    "fixed_success": bool(fixed_result["success"]),
-                    "initial": initial,
-                    "optimized": optimized,
-                    "change_pct": change_pct,
-                }
-
-            summary.append(
+        if ret is None or log is None:
+            pose_records.append(
                 {
                     "query": query_name,
-                    "status": "localized",
-                    "source": selected_source,
-                    "inliers": int(inliers),
-                    "center": center.tolist(),
-                    "center_distance_m": center_distance_m,
-                    "gt_center": query_gt_center.tolist()
-                    if query_gt_center is not None
-                    else None,
-                    "fallback_attempted": fallback_attempted,
+                    "status": "failed",
+                    "pose_source": "none",
+                    "qvec": None,
+                    "tvec": None,
+                    "camera": None,
+                    "inliers": 0,
+                    "center_distance_m": None,
                     "fallback_used": fallback_used,
-                    "fallback_success": fallback_success,
-                    "fallback_reason": fallback_reason,
-                    "reprojection_stats": reprojection_stats,
                 }
             )
+            continue
 
-    write_results_file(localized_raw_poses, results_path)
-    with open(summary_path, "w", encoding="utf-8") as summary_fh:
-        json.dump(summary, summary_fh, indent=2)
+        selected_pose = ret["cam_from_world"]
+        selected_camera = ret.get("camera", camera)
 
-    logger.info("Localized %d / %d queries.", len(localized_raw_poses), len(queries))
-    logger.info("Saved poses: %s", results_path)
-    logger.info("Saved extra COLMAP exports: %s and %s", extra_cams_path, extra_images_path)
-    logger.info("Saved summary JSON: %s", summary_path)
+        if args.use_fixed_center and gt_center is not None:
+            inlier_mask = np.asarray(ret.get("inlier_mask", []), dtype=bool)
+            points2d, points3d = extract_inlier_correspondences(model, log, inlier_mask)
+            if len(points2d) >= 4:
+                fixed_ret = refine_pose_fixed_center(
+                    points2d=points2d,
+                    points3d=points3d,
+                    camera=selected_camera,
+                    fixed_center=gt_center,
+                    initial_rotation=selected_pose.rotation.matrix(),
+                    initial_translation=np.asarray(selected_pose.translation, dtype=float),
+                    optimize_focal=True,
+                )
+                if fixed_ret["success"]:
+                    selected_pose = rigid3d_from_rt(
+                        fixed_ret["rotation_matrix"], fixed_ret["translation_vector"]
+                    )
+                    pose_source = "fixed"
+                    selected_camera_dict = camera_to_simple_radial(
+                        selected_camera, focal_override=float(fixed_ret["focal_length"])
+                    )
+                else:
+                    selected_camera_dict = camera_to_simple_radial(selected_camera)
+            else:
+                selected_camera_dict = camera_to_simple_radial(selected_camera)
+        else:
+            selected_camera_dict = camera_to_simple_radial(selected_camera)
+
+        final_poses[query_name] = selected_pose
+        qxyzw = np.asarray(selected_pose.rotation.quat, dtype=float)
+        qvec = [float(qxyzw[3]), float(qxyzw[0]), float(qxyzw[1]), float(qxyzw[2])]
+        tvec = [float(v) for v in np.asarray(selected_pose.translation, dtype=float).reshape(3)]
+
+        center_distance_m = None
+        if gt_center is not None:
+            center_distance_m = float(np.linalg.norm(compute_center(selected_pose) - gt_center))
+
+        pose_records.append(
+            {
+                "query": query_name,
+                "status": "localized",
+                "pose_source": pose_source,
+                "qvec": qvec,
+                "tvec": tvec,
+                "camera": selected_camera_dict,
+                "inliers": int(metrics["inliers"]),
+                "center_distance_m": center_distance_m,
+                "fallback_used": fallback_used,
+            }
+        )
+
+    write_poses(final_poses, results_path, prepend_camera_name=False)
+    with open(poses_json_path, "w", encoding="utf-8") as fh:
+        json.dump(pose_records, fh, indent=2)
+
+    logger.info("Localized %d / %d queries.", len(final_poses), len(queries))
+    logger.info("Saved results to %s", results_path)
+    logger.info("Saved poses JSON to %s", poses_json_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="GOTCHA pipeline for known-pose SfM and query localization.")
+    parser = argparse.ArgumentParser(description="GOTCHA pipeline")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    empty_rec = subparsers.add_parser(
-        "prepare_empty_rec",
-        help=(
-            "Convert OpenSfM/ODM NVM to COLMAP empty_rec using fixed paths: "
-            "project/opensfm/undistorted/reconstruction.nvm -> project/empty_rec "
-            "with images from project/images."
-        ),
-    )
+    empty_rec = subparsers.add_parser("prepare_empty_rec", help="Create empty_rec from OpenSfM/ODM NVM.")
     empty_rec.add_argument("--project", type=Path, required=True)
     empty_rec.set_defaults(func=run_prepare_empty_rec)
 
-    prepare = subparsers.add_parser(
-        "prepare_reference",
-        help="Triangulate a sparse reference model from known poses in project/empty_rec.",
-    )
+    prepare = subparsers.add_parser("prepare_reference", help="Triangulate reference points from empty_rec.")
     prepare.add_argument("--project", type=Path, required=True)
-    prepare.add_argument("--local-feature-conf", default="superpoint_max")
-    prepare.add_argument("--matcher-conf", default="superpoint+lightglue")
-    prepare.add_argument("--max-keypoints", type=int, default=10000)
-    prepare.add_argument("--num-pose-pairs", type=int, default=35)
-    prepare.add_argument("--rotation-threshold", type=float, default=120.0)
-    prepare.add_argument("--overwrite-features", action="store_true")
-    prepare.add_argument("--overwrite-matches", action="store_true")
-    prepare.add_argument("--skip-geometric-verification", action="store_true")
-    prepare.add_argument("--estimate-two-view-geometries", action="store_true")
     prepare.add_argument("--allow-pose-adjustment", action="store_true")
-    prepare.add_argument("--verbose", action="store_true")
     prepare.set_defaults(func=run_prepare_reference)
 
-    localize = subparsers.add_parser(
-        "localize_queries",
-        help="Localize query images with optional fixed-center refinement.",
-    )
+    localize = subparsers.add_parser("localize_queries", help="Localize query images against sfm_triangulated.")
     localize.add_argument("--project", type=Path, required=True)
-    localize.add_argument("--local-feature-conf", default="superpoint_max")
-    localize.add_argument("--global-feature-conf", default="netvlad")
-    localize.add_argument("--matcher-conf", default="superpoint+lightglue")
-    localize.add_argument("--max-keypoints", type=int, default=10000)
-    localize.add_argument("--num-matched", type=int, default=35)
-    localize.add_argument("--manual-pairs", type=Path)
-    localize.add_argument("--trials", type=int, default=5)
-    localize.add_argument("--ransac-max-error", type=float, default=12.0)
-    localize.add_argument("--ransac-confidence", type=float, default=0.99)
-    localize.add_argument("--ransac-min-inlier-ratio", type=float, default=0.3)
-    localize.add_argument("--ransac-min-num-trials", type=int, default=100)
-    localize.add_argument("--ransac-max-num-trials", type=int, default=20000)
-    localize.add_argument("--refine-max-num-iterations", type=int, default=10000)
-    localize.add_argument("--fallback-exhaustive", action="store_true")
-    localize.add_argument("--fallback-trials", type=int, default=10)
-    localize.add_argument("--fallback-min-inliers", type=int, default=15)
     localize.add_argument("--gt-center", nargs=3, type=float)
     localize.add_argument("--use-fixed-center", action="store_true")
-    localize.add_argument("--keep-focal-fixed", action="store_true")
-    localize.add_argument("--fixed-center-max-nfev", type=int, default=200)
+    localize.add_argument("--fallback-exhaustive", action="store_true")
     localize.add_argument("--initial-focal-length", type=float)
-    localize.add_argument("--ensure-ref-features", action="store_true")
-    localize.add_argument("--overwrite-features", action="store_true")
-    localize.add_argument("--overwrite-matches", action="store_true")
-    localize.add_argument("--overwrite-global-descriptors", action="store_true")
     localize.set_defaults(func=run_localize_queries)
 
     return parser
