@@ -105,18 +105,28 @@ def pose_from_cluster(dataset_dir, q, retrieved, feature_file, match_file, skip=
     all_mkp3d = np.concatenate(all_mkp3d, 0)
     all_indices = np.concatenate(all_indices, 0)
 
-    cfg = {
+    camera = pycolmap.Camera(
+        model="SIMPLE_PINHOLE",
+        width=width,
+        height=height,
+        params=np.array([focal_length, cx, cy], float),
+    )
+    estimation_options = pycolmap.AbsolutePoseEstimationOptions()
+    estimation_options.ransac.max_error = 48
+    refinement_options = pycolmap.AbsolutePoseRefinementOptions()
+    ret = pycolmap.estimate_and_refine_absolute_pose(
+        all_mkpq,
+        all_mkp3d,
+        camera,
+        estimation_options=estimation_options,
+        refinement_options=refinement_options,
+    )
+    ret["cfg"] = {
         "model": "SIMPLE_PINHOLE",
         "width": width,
         "height": height,
         "params": [focal_length, cx, cy],
     }
-    estimation_options = pycolmap.AbsolutePoseEstimationOptions()
-    estimation_options.ransac.max_error = 48
-    ret = pycolmap.estimate_and_refine_absolute_pose(
-        all_mkpq, all_mkp3d, cfg, estimation_options
-    )
-    ret["cfg"] = cfg
     return ret, all_mkpq, all_mkpr, all_mkp3d, all_indices, num_matches
 
 

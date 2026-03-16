@@ -2,7 +2,7 @@ import argparse
 import pickle
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Union
 
 import numpy as np
 import pycolmap
@@ -50,10 +50,46 @@ def do_covisibility_clustering(
     return clusters
 
 
+def _build_abs_pose_estimation_options(
+    options: Union[None, Dict[str, Any], pycolmap.AbsolutePoseEstimationOptions],
+) -> pycolmap.AbsolutePoseEstimationOptions:
+    if isinstance(options, pycolmap.AbsolutePoseEstimationOptions):
+        return options
+    estimation = pycolmap.AbsolutePoseEstimationOptions()
+    if not options:
+        return estimation
+    for key, value in options.items():
+        if key == "ransac":
+            for ransac_key, ransac_value in value.items():
+                setattr(estimation.ransac, ransac_key, ransac_value)
+        else:
+            setattr(estimation, key, value)
+    return estimation
+
+
+def _build_abs_pose_refinement_options(
+    options: Union[None, Dict[str, Any], pycolmap.AbsolutePoseRefinementOptions],
+) -> pycolmap.AbsolutePoseRefinementOptions:
+    if isinstance(options, pycolmap.AbsolutePoseRefinementOptions):
+        return options
+    refinement = pycolmap.AbsolutePoseRefinementOptions()
+    if not options:
+        return refinement
+    for key, value in options.items():
+        setattr(refinement, key, value)
+    return refinement
+
+
 class QueryLocalizer:
     def __init__(self, reconstruction, config=None):
         self.reconstruction = reconstruction
         self.config = config or {}
+        self.estimation_options = _build_abs_pose_estimation_options(
+            self.config.get("estimation")
+        )
+        self.refinement_options = _build_abs_pose_refinement_options(
+            self.config.get("refinement")
+        )
 
     def localize(self, points2D_all, points2D_idxs, points3D_id, query_camera):
         points2D = points2D_all[points2D_idxs]
@@ -64,8 +100,8 @@ class QueryLocalizer:
             points2D,
             points3D,
             query_camera,
-            estimation_options=self.config.get("estimation", {}),
-            refinement_options=self.config.get("refinement", {}),
+            estimation_options=self.estimation_options,
+            refinement_options=self.refinement_options,
         )
         return ret
 
